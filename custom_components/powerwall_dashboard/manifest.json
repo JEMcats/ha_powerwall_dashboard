@@ -1,0 +1,14 @@
+{
+  "domain": "powerwall_dashboard",
+  "name": "Powerwall Dashboard",
+  "codeowners": [
+    "@JEMcats"
+  ],
+  "config_flow": true,
+  "documentation": "https://github.com/jemcats/ha_powerwall_dashboard",
+  "integration_type": "service",
+  "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/jemcats/ha_powerwall_dashboard/issues",
+  "requirements": [],
+  "version": "1.0.0"
+}
