@@ -1,4 +1,5 @@
 {
   "name": "Powerwall Dashboard",
-  "content_in_root": false
+  "content_in_root": false,
+  "homeassistant": "2024.12"
 }
