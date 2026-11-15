@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from homeassistant.components.sensor import (
@@ -12,30 +13,19 @@ from homeassistant.components.sensor import (
     SensorEntityDescription,
     SensorStateClass,
 )
-from homeassistant.const import PERCENTAGE, UnitOfEnergy, UnitOfPower
+from homeassistant.const import PERCENTAGE, UnitOfEnergy, UnitOfPower, UnitOfTime
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import StateType
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import CONF_PYPOWERWALL_URL, DOMAIN
-from .coordinator import InfluxDbCoordinator, PyPowerwallCoordinator
+from .const import DEFAULT_STRING_NAMES
+from .coordinator import ControlCoordinator, InfluxDbCoordinator, PyPowerwallCoordinator
+from .entity import PowerwallControlEntity, max_backup_end, powerwall_device_info
 
 if TYPE_CHECKING:
     from . import PowerwallDashboardConfigEntry
-
-
-def _device_info(entry: PowerwallDashboardConfigEntry) -> DeviceInfo:
-    """Return the single device that all of this entry's sensors belong to."""
-    return DeviceInfo(
-        identifiers={(DOMAIN, entry.entry_id)},
-        name="Powerwall",
-        manufacturer="Tesla",
-        model="Powerwall",
-        entry_type=DeviceEntryType.SERVICE,
-        configuration_url=entry.data.get(CONF_PYPOWERWALL_URL),
-    )
 
 
 # ----------------------------------------------------------------------
@@ -82,6 +72,14 @@ def _grid_status(data: dict[str, Any]) -> str | None:
     """Map pypowerwall's grid status to a sensor state (None = unknown)."""
     try:
         return GRID_STATUS_MAP.get(data["grid_status"]["grid_status"])
+    except (KeyError, TypeError):
+        return None
+
+
+def _time_remaining(data: dict[str, Any]) -> float | None:
+    """Time until depletion, in hours."""
+    try:
+        return data["time_remaining"]
     except (KeyError, TypeError):
         return None
 
@@ -146,6 +144,16 @@ POWERWALL_SENSORS: tuple[PowerwallSensorDescription, ...] = (
         options=list(GRID_STATUS_MAP.values()),
         value_fn=_grid_status,
     ),
+    PowerwallSensorDescription(
+        key="time_remaining",
+        translation_key="time_remaining",
+        icon="mdi:battery-clock-outline",
+        native_unit_of_measurement=UnitOfTime.HOURS,
+        device_class=SensorDeviceClass.DURATION,
+        state_class=SensorStateClass.MEASUREMENT,
+        suggested_display_precision=2,
+        value_fn=_time_remaining,
+    ),
 )
 
 
@@ -165,7 +173,7 @@ class PowerwallSensor(CoordinatorEntity[PyPowerwallCoordinator], SensorEntity):
         super().__init__(coordinator)
         self.entity_description = description
         self._attr_unique_id = f"{entry.entry_id}_{description.key}"
-        self._attr_device_info = _device_info(entry)
+        self._attr_device_info = powerwall_device_info(entry)
 
     @property
     def native_value(self) -> StateType:
@@ -215,12 +223,105 @@ class InfluxEnergySensor(CoordinatorEntity[InfluxDbCoordinator], SensorEntity):
         super().__init__(coordinator)
         self.entity_description = description
         self._attr_unique_id = f"{entry.entry_id}_{description.key}"
-        self._attr_device_info = _device_info(entry)
+        self._attr_device_info = powerwall_device_info(entry)
 
     @property
     def native_value(self) -> float | None:
         """Return today's total in kWh."""
         return self.coordinator.data.get(self.entity_description.key)
+
+
+# ----------------------------------------------------------------------
+# Solar string sensors (pypowerwall /strings, opt-in via "Show strings")
+# ----------------------------------------------------------------------
+class PowerwallStringSensor(CoordinatorEntity[PyPowerwallCoordinator], SensorEntity):
+    """Power from one solar string (A, B, C, ...), in watts."""
+
+    _attr_has_entity_name = True
+    _attr_translation_key = "string_power"
+    _attr_icon = "mdi:solar-panel"
+    _attr_native_unit_of_measurement = UnitOfPower.WATT
+    _attr_device_class = SensorDeviceClass.POWER
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_suggested_display_precision = 2
+
+    def __init__(
+        self,
+        coordinator: PyPowerwallCoordinator,
+        string_name: str,
+        entry: PowerwallDashboardConfigEntry,
+    ) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator)
+        self._string_name = string_name
+        self._attr_unique_id = f"{entry.entry_id}_string_{string_name.lower()}_power"
+        self._attr_translation_placeholders = {"string": string_name}
+        self._attr_device_info = powerwall_device_info(entry)
+
+    @property
+    def _string(self) -> dict[str, Any] | None:
+        """This string's block of the /strings response, if present."""
+        strings = (self.coordinator.data or {}).get("strings")
+        if not isinstance(strings, dict):
+            return None
+        value = strings.get(self._string_name)
+        return value if isinstance(value, dict) else None
+
+    @property
+    def native_value(self) -> float | None:
+        """Return the string's power in watts."""
+        string = self._string
+        if string is None:
+            return None
+        power = string.get("Power")
+        # The gateway reports float noise like 183.74999999999991.
+        return round(power, 2) if isinstance(power, (int, float)) else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Expose the rest of the string's readings as attributes."""
+        string = self._string
+        if string is None:
+            return None
+        current = string.get("Current")
+        return {
+            "state": string.get("State"),
+            "voltage": string.get("Voltage"),
+            "current": round(current, 2) if isinstance(current, (int, float)) else current,
+            "connected": string.get("Connected"),
+        }
+
+
+def _remove_string_entities(hass: HomeAssistant, entry: PowerwallDashboardConfigEntry) -> None:
+    """Remove string entities from the registry (used when the option is off)."""
+    registry = er.async_get(hass)
+    prefix = f"{entry.entry_id}_string_"
+    for entity in er.async_entries_for_config_entry(registry, entry.entry_id):
+        if entity.unique_id.startswith(prefix):
+            registry.async_remove(entity.entity_id)
+
+
+# ----------------------------------------------------------------------
+# Max backup end time (only when controls are enabled)
+# ----------------------------------------------------------------------
+class MaxBackupEndsSensor(PowerwallControlEntity, SensorEntity):
+    """When the current manual max backup ends, as a timestamp."""
+
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _attr_icon = "mdi:timer-sand"
+
+    def __init__(
+        self,
+        coordinator: ControlCoordinator,
+        entry: PowerwallDashboardConfigEntry,
+    ) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, entry, "max_backup_ends")
+
+    @property
+    def native_value(self) -> datetime | None:
+        """The end time while max backup is active, otherwise unknown."""
+        return max_backup_end(self.control_data)
 
 
 # ----------------------------------------------------------------------
@@ -242,4 +343,23 @@ async def async_setup_entry(
         InfluxEnergySensor(data.influxdb_coordinator, description, entry)
         for description in ENERGY_SENSORS
     )
+    if data.show_strings:
+        strings = data.powerwall_coordinator.data.get("strings")
+        names = (
+            sorted(name for name, value in strings.items() if isinstance(value, dict))
+            if isinstance(strings, dict)
+            else []
+        )
+        # If /strings couldn't be read at startup, still create A-F.
+        for name in names or DEFAULT_STRING_NAMES:
+            entities.append(
+                PowerwallStringSensor(data.powerwall_coordinator, name, entry)
+            )
+    else:
+        # Switched off: drop any string entities left over from when it was on.
+        _remove_string_entities(hass, entry)
+
+    if data.control_coordinator is not None:
+        entities.append(MaxBackupEndsSensor(data.control_coordinator, entry))
+
     async_add_entities(entities)

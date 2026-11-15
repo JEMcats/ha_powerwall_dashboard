@@ -1,4 +1,4 @@
-"""Config, reconfigure and options flows for the PyPowerwall Proxy integration."""
+"""Config, reconfigure and options flows for the Powerwall Dashboard integration."""
 
 from __future__ import annotations
 
@@ -34,6 +34,7 @@ from .const import (
     CONF_INFLUXDB_URL,
     CONF_PYPOWERWALL_URL,
     CONF_SCAN_INTERVAL,
+    CONF_SHOW_STRINGS,
     CONF_TIMEZONE,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
@@ -44,7 +45,7 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=10)
-ENTRY_TITLE = "PyPowerwall Proxy"
+ENTRY_TITLE = "Powerwall Dashboard"
 
 
 # ----------------------------------------------------------------------
@@ -147,8 +148,8 @@ def _scan_interval_selector() -> NumberSelector:
 # ----------------------------------------------------------------------
 # Initial setup + reconfigure
 # ----------------------------------------------------------------------
-class PyPowerwallProxyConfigFlow(ConfigFlow, domain=DOMAIN):
-    """Handle a config flow for PyPowerwall Proxy."""
+class PowerwallDashboardConfigFlow(ConfigFlow, domain=DOMAIN):
+    """Handle a config flow for Powerwall Dashboard."""
 
     VERSION = 1
 
@@ -160,7 +161,7 @@ class PyPowerwallProxyConfigFlow(ConfigFlow, domain=DOMAIN):
     @callback
     def async_get_options_flow(config_entry: ConfigEntry) -> OptionsFlow:
         """Return the options flow handler."""
-        return PyPowerwallProxyOptionsFlow()
+        return PowerwallDashboardOptionsFlow()
 
     # -- Step 1: connection details ------------------------------------
     async def async_step_user(
@@ -187,6 +188,7 @@ class PyPowerwallProxyConfigFlow(ConfigFlow, domain=DOMAIN):
                     CONF_TIMEZONE: tz_name,
                     CONF_ALLOW_CONTROLS: user_input[CONF_ALLOW_CONTROLS],
                     CONF_SCAN_INTERVAL: int(user_input[CONF_SCAN_INTERVAL]),
+                    CONF_SHOW_STRINGS: user_input[CONF_SHOW_STRINGS],
                 }
 
                 if self._data[CONF_ALLOW_CONTROLS]:
@@ -201,6 +203,7 @@ class PyPowerwallProxyConfigFlow(ConfigFlow, domain=DOMAIN):
                 vol.Required(
                     CONF_SCAN_INTERVAL, default=DEFAULT_SCAN_INTERVAL
                 ): _scan_interval_selector(),
+                vol.Required(CONF_SHOW_STRINGS, default=False): BooleanSelector(),
                 vol.Required(CONF_ALLOW_CONTROLS, default=False): BooleanSelector(),
             }
         )
@@ -286,8 +289,8 @@ class PyPowerwallProxyConfigFlow(ConfigFlow, domain=DOMAIN):
 # ----------------------------------------------------------------------
 # Options flow
 # ----------------------------------------------------------------------
-class PyPowerwallProxyOptionsFlow(OptionsFlow):
-    """Handle options: timezone, allow controls and the control secret."""
+class PowerwallDashboardOptionsFlow(OptionsFlow):
+    """Handle options: timezone, polling interval, strings, controls and secret."""
 
     def __init__(self) -> None:
         """Initialize the flow."""
@@ -301,7 +304,7 @@ class PyPowerwallProxyOptionsFlow(OptionsFlow):
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Edit timezone and the allow controls toggle."""
+        """Edit timezone, polling interval, show strings and the controls toggle."""
         errors: dict[str, str] = {}
         current = self._current
 
@@ -314,6 +317,7 @@ class PyPowerwallProxyOptionsFlow(OptionsFlow):
                     CONF_TIMEZONE: tz_name,
                     CONF_ALLOW_CONTROLS: user_input[CONF_ALLOW_CONTROLS],
                     CONF_SCAN_INTERVAL: int(user_input[CONF_SCAN_INTERVAL]),
+                    CONF_SHOW_STRINGS: user_input[CONF_SHOW_STRINGS],
                 }
                 if self._options[CONF_ALLOW_CONTROLS]:
                     return await self.async_step_controls()
@@ -327,6 +331,10 @@ class PyPowerwallProxyOptionsFlow(OptionsFlow):
                     CONF_SCAN_INTERVAL,
                     default=current.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL),
                 ): _scan_interval_selector(),
+                vol.Required(
+                    CONF_SHOW_STRINGS,
+                    default=current.get(CONF_SHOW_STRINGS, False),
+                ): BooleanSelector(),
                 vol.Required(
                     CONF_ALLOW_CONTROLS,
                     default=current.get(CONF_ALLOW_CONTROLS, False),
