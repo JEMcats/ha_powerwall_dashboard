@@ -59,6 +59,7 @@ GRID_EXPORT_MODES = ["battery_ok", "pv_only", "never"]
 # Max backup: the server accepts 60 seconds and up. The duration entity works in
 # minutes.
 MAX_BACKUP_MIN_SECONDS = 60
+MAX_BACKUP_MAX_SECONDS = 4294967295  # the server's upper limit
 MAX_BACKUP_MIN_MINUTES = 1
 MAX_BACKUP_MAX_MINUTES = 10080  # 7 days
 DEFAULT_MAX_BACKUP_MINUTES = 60
