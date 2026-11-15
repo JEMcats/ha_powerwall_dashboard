@@ -1,7 +1,7 @@
 # Powerwall Dashboard Integration for Home Assistant
 Allows you to connect to a PyPowerwall proxy and an InfluxDB instance to get metrics and control your Tesla Powerwall System.
 
-***Warning, the large majority of the project was written completely by AI!***
+***Warning, the large majority of the project was written by AI!***
 
 ## Requirements
 - A stable instance of ```influxdb```, ```telegraf```, and ```pypowerwall```.
