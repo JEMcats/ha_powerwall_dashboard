@@ -102,7 +102,8 @@
       "powerwall_capacity_deviation": { "name": "{powerwall} capacity deviation" },
       "combined_capacity": { "name": "Combined total capacity" },
       "combined_charge": { "name": "Combined current charge" },
-      "combined_capacity_deviation": { "name": "Combined capacity deviation" }
+      "combined_capacity_deviation": { "name": "Combined capacity deviation" },
+      "gateway_uptime": { "name": "Gateway uptime" }
     },
     "binary_sensor": {
       "storm_watch_active": { "name": "Storm Watch active" }

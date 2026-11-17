@@ -26,6 +26,9 @@ PYPOWERWALL_POD_PATH = "/pod"
 PYPOWERWALL_TEMPS_PATH = "/temps/pw"
 PYPOWERWALL_FANS_PATH = "/fans/pw"
 
+# The gateway's own status, used for its uptime (up_time_seconds).
+PYPOWERWALL_STATUS_PATH = "/api/status"
+
 # Read endpoints for the control entities (no token needed). The grid connection
 # switch reads PYPOWERWALL_GRID_STATUS_PATH, the same data as the Grid status sensor.
 PYPOWERWALL_GET_RESERVE_PATH = "/pw/get_reserve"

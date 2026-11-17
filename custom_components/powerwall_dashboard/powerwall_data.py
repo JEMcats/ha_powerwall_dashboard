@@ -8,10 +8,13 @@ endpoint, with the leader first, so that numbering is used as the identity:
 * /temps/pw    PW1_temp, PW2_temp, ... in Celsius (None for no reading)
 * /fans/pw     FAN1_actual (rpm), FAN1_duty (%), FAN2_actual, ... (Powerwall 3
                only: two fans per unit, so PW1 owns FAN1-2, PW2 owns FAN3-4)
+* /api/status  up_time_seconds: the gateway's uptime as a Go duration string,
+               e.g. "127h34m16.275122187s" (null on some setups)
 """
 
 from __future__ import annotations
 
+import math
 import re
 from typing import Any
 
@@ -36,6 +39,70 @@ def _number(value: Any) -> float | None:
     return None
 
 
+# The gateway writes durations the way Go does: "127h34m16.275122187s".
+_GO_DURATION = re.compile(r"(?:\d+(?:\.\d+)?(?:ns|us|µs|ms|s|m|h))+")
+_GO_DURATION_PART = re.compile(r"(\d+(?:\.\d+)?)(ns|us|µs|ms|s|m|h)")
+_GO_UNIT_SECONDS = {
+    "ns": 1e-9,
+    "us": 1e-6,
+    "µs": 1e-6,
+    "ms": 1e-3,
+    "s": 1.0,
+    "m": 60.0,
+    "h": 3600.0,
+}
+
+
+def parse_uptime(value: Any) -> float | None:
+    """Return a gateway uptime in seconds, or None if there isn't a usable one.
+
+    /api/status calls the field up_time_seconds but sends a Go duration string such
+    as "127h34m16.275122187s". A plain non-negative number is taken as seconds.
+    Anything else, including null, gives None.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        seconds = float(value)
+        return seconds if math.isfinite(seconds) and seconds >= 0 else None
+    if isinstance(value, str) and _GO_DURATION.fullmatch(value):
+        return sum(
+            float(number) * _GO_UNIT_SECONDS[unit]
+            for number, unit in _GO_DURATION_PART.findall(value)
+        )
+    return None
+
+
+def format_uptime(seconds: float) -> str:
+    """Spell an uptime out, from its largest unit down: "5d 7h 34m 16s"."""
+    days, rest = divmod(int(seconds), 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes, secs = divmod(rest, 60)
+    if days:
+        return f"{days}d {hours}h {minutes}m {secs}s"
+    if hours:
+        return f"{hours}h {minutes}m {secs}s"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+def build_gateway(status: Any) -> dict[str, Any]:
+    """Gateway facts from /api/status.
+
+    Only the uptime is used. start_time is deliberately ignored: older pypowerwall
+    versions filled it with the commission date in some modes, so it can't be
+    trusted to mean when the gateway started.
+    """
+    uptime = (
+        parse_uptime(status.get("up_time_seconds")) if isinstance(status, dict) else None
+    )
+    return {
+        "uptime_seconds": uptime,
+        "uptime_text": format_uptime(uptime) if uptime is not None else None,
+    }
+
+
 def powerwall_model(name: Any) -> tuple[str | None, float]:
     """Return (model name, published capacity in kWh) for a /pod device name.
 
@@ -58,11 +125,14 @@ def deviation_percent(capacity_kwh: float | None, spec_kwh: float | None) -> flo
     return (capacity_kwh - spec_kwh) / spec_kwh * 100
 
 
-def build_diagnostics(pod: Any, temps: Any, fans: Any) -> dict[str, Any]:
-    """Combine /pod, /temps/pw and /fans/pw into per-Powerwall and combined data.
+def build_diagnostics(
+    pod: Any, temps: Any, fans: Any, status: Any = None
+) -> dict[str, Any]:
+    """Combine /pod, /temps/pw, /fans/pw and /api/status into diagnostic data.
 
     Any argument may be None or empty (that endpoint failed or has no data).
-    Returns {"powerwalls": {1: {...}, 2: {...}}, "combined": {...}}.
+    Returns {"powerwalls": {1: {...}, 2: {...}}, "combined": {...},
+    "gateway": {...}}.
     """
     pod = pod if isinstance(pod, dict) else {}
     temps = temps if isinstance(temps, dict) else {}
@@ -144,4 +214,8 @@ def build_diagnostics(pod: Any, temps: Any, fans: Any) -> dict[str, Any]:
         ),
     }
 
-    return {"powerwalls": powerwalls, "combined": combined}
+    return {
+        "powerwalls": powerwalls,
+        "combined": combined,
+        "gateway": build_gateway(status),
+    }

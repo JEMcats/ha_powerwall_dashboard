@@ -531,14 +531,31 @@ COMBINED_SENSORS: tuple[DiagnosticSensorDescription, ...] = (
 )
 
 
+GATEWAY_SENSORS: tuple[DiagnosticSensorDescription, ...] = (
+    DiagnosticSensorDescription(
+        key="uptime",
+        translation_key="gateway_uptime",
+        icon="mdi:timer-outline",
+        native_unit_of_measurement=UnitOfTime.SECONDS,
+        device_class=SensorDeviceClass.DURATION,
+        state_class=SensorStateClass.MEASUREMENT,
+        # Shown in hours by default; the "uptime" attribute spells it out in days.
+        suggested_unit_of_measurement=UnitOfTime.HOURS,
+        suggested_display_precision=1,
+        value_fn=lambda gateway: gateway.get("uptime_seconds"),
+        attrs_fn=lambda gateway: {"uptime": gateway.get("uptime_text")},
+    ),
+)
+
+
 class PowerwallDiagnosticSensor(
     CoordinatorEntity[DiagnosticsCoordinator], SensorEntity
 ):
-    """A diagnostic sensor for one Powerwall, or for the whole system.
+    """A diagnostic sensor for one Powerwall, or for a system-wide block.
 
-    index is the Powerwall's number (1 is the leader), or None for the combined
-    sensors. temperature_unit, for temperature sensors, is the display unit chosen
-    in the integration's options.
+    index is the Powerwall's number (1 is the leader), or None for a system-wide
+    block, named by block_name ("combined" or "gateway"). temperature_unit, for
+    temperature sensors, is the display unit chosen in the integration's options.
     """
 
     entity_description: DiagnosticSensorDescription
@@ -552,12 +569,14 @@ class PowerwallDiagnosticSensor(
         entry: PowerwallDashboardConfigEntry,
         index: int | None,
         temperature_unit: str | None = None,
+        block_name: str = "combined",
     ) -> None:
         """Initialize the sensor."""
         super().__init__(coordinator)
         self.entity_description = description
         self._index = index
-        scope = "combined" if index is None else f"pw{index}"
+        self._block_name = block_name
+        scope = block_name if index is None else f"pw{index}"
         self._attr_unique_id = f"{entry.entry_id}_{scope}_{description.key}"
         if index is not None:
             self._attr_translation_placeholders = {"powerwall": f"PW{index}"}
@@ -569,10 +588,10 @@ class PowerwallDiagnosticSensor(
 
     @property
     def _block(self) -> dict[str, Any] | None:
-        """This Powerwall's block of the data, or the combined block."""
+        """This Powerwall's block of the data, or the combined/gateway block."""
         data = self.coordinator.data or {}
         if self._index is None:
-            return data.get("combined")
+            return data.get(self._block_name)
         return (data.get("powerwalls") or {}).get(self._index)
 
     @property
@@ -655,6 +674,20 @@ def _async_track_diagnostics(
                 known.add(unique_key)
                 new.append(
                     PowerwallDiagnosticSensor(coordinator, description, entry, None)
+                )
+
+        # Gateway uptime: only once the gateway reports one (some setups report
+        # null), so there is no permanently empty sensor.
+        if (diagnostics.get("gateway") or {}).get("uptime_seconds") is not None:
+            for description in GATEWAY_SENSORS:
+                unique_key = f"gateway_{description.key}"
+                if unique_key in known:
+                    continue
+                known.add(unique_key)
+                new.append(
+                    PowerwallDiagnosticSensor(
+                        coordinator, description, entry, None, block_name="gateway"
+                    )
                 )
 
         if new:

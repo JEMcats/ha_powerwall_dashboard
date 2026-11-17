@@ -44,6 +44,7 @@ from .const import (
     PYPOWERWALL_GRID_STATUS_PATH,
     PYPOWERWALL_POD_PATH,
     PYPOWERWALL_SOE_PATH,
+    PYPOWERWALL_STATUS_PATH,
     PYPOWERWALL_STRINGS_PATH,
     PYPOWERWALL_TEMPS_PATH,
     PYPOWERWALL_TIME_REMAINING_PATH,
@@ -294,7 +295,8 @@ class DiagnosticsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Fetch per-Powerwall temperatures, fans and capacity from the proxy.
 
     The data comes from powerwall_data.build_diagnostics(): a "powerwalls" dict
-    keyed by PW number (1 is the leader) and a "combined" block for the system.
+    keyed by PW number (1 is the leader), a "combined" block for the system and a
+    "gateway" block (its uptime).
     """
 
     config_entry: PowerwallDashboardConfigEntry
@@ -330,15 +332,18 @@ class DiagnosticsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return None
 
     async def _async_update_data(self) -> dict[str, Any]:
-        """Read the three endpoints concurrently and combine them."""
-        pod, temps, fans = await asyncio.gather(
+        """Read the four endpoints concurrently and combine them."""
+        pod, temps, fans, status = await asyncio.gather(
             self._fetch_optional(PYPOWERWALL_POD_PATH),
             self._fetch_optional(PYPOWERWALL_TEMPS_PATH),
             self._fetch_optional(PYPOWERWALL_FANS_PATH),
+            self._fetch_optional(PYPOWERWALL_STATUS_PATH),
         )
-        if pod is None and temps is None and fans is None:
-            raise UpdateFailed("Could not read /pod, /temps/pw or /fans/pw")
-        return build_diagnostics(pod, temps, fans)
+        if pod is None and temps is None and fans is None and status is None:
+            raise UpdateFailed(
+                "Could not read /pod, /temps/pw, /fans/pw or /api/status"
+            )
+        return build_diagnostics(pod, temps, fans, status)
 
 
 class ControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
