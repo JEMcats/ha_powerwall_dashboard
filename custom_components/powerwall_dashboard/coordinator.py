@@ -3,16 +3,17 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import timedelta
+from datetime import datetime, timedelta
 import json
 import logging
+import math
 import time
 from typing import TYPE_CHECKING, Any
 
 import aiohttp
 
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import (
     DataUpdateCoordinator,
@@ -27,25 +28,28 @@ from .const import (
     CONTROL_MAX_BACKUP_PATH,
     CONTROL_MODE_PATH,
     CONTROL_RESERVE_PATH,
-    DEFAULT_MAX_BACKUP_MINUTES,
     DOMAIN,
     ENERGY_FIELDS,
+    GRID_STATUS_MAP,
     INFLUXDB_DATABASE,
     INFLUXDB_MEASUREMENT,
     INFLUXDB_RETENTION_POLICY,
+    MAX_BACKUP_HOLD_SECONDS,
+    MAX_BACKUP_MAX_SECONDS,
     MAX_BACKUP_MIN_SECONDS,
     PYPOWERWALL_AGGREGATES_PATH,
+    PYPOWERWALL_FANS_PATH,
     PYPOWERWALL_GET_MODE_PATH,
     PYPOWERWALL_GET_RESERVE_PATH,
     PYPOWERWALL_GRID_STATUS_PATH,
-    PYPOWERWALL_IS_CONNECTED_PATH,
+    PYPOWERWALL_POD_PATH,
     PYPOWERWALL_SOE_PATH,
     PYPOWERWALL_STRINGS_PATH,
+    PYPOWERWALL_TEMPS_PATH,
     PYPOWERWALL_TIME_REMAINING_PATH,
     PYPOWERWALL_UPDATE_STATUS_PATH,
-    SCAN_INTERVAL_CONTROL,
-    SCAN_INTERVAL_UPDATE,
 )
+from .powerwall_data import build_diagnostics
 
 if TYPE_CHECKING:
     from . import PowerwallDashboardConfigEntry
@@ -102,8 +106,24 @@ def _field(payload: Any, key: str) -> Any:
     return payload.get(key) if isinstance(payload, dict) else None
 
 
+def _grid_connected(payload: Any) -> bool | None:
+    """Whether the house is on the grid, from /api/system_status/grid_status.
+
+    Reads the same field as the Grid status sensor and maps it the same way:
+    connected is True, disconnected (islanded) is False, and anything else,
+    including the brief transition back to the grid, is None (unknown).
+    """
+    raw = _field(payload, "grid_status")
+    state = GRID_STATUS_MAP.get(raw) if isinstance(raw, str) else None
+    if state == "connected":
+        return True
+    if state == "disconnected":
+        return False
+    return None
+
+
 def _build_control_data(
-    is_connected: Any,
+    grid_status: Any,
     reserve: Any,
     mode: Any,
     grid_charging: Any,
@@ -112,11 +132,11 @@ def _build_control_data(
 ) -> dict[str, Any]:
     """Turn the raw control responses into the coordinator's data dict.
 
-    Each response is a small JSON object, e.g. {"is_connected": true} or
-    {"reserve": 20}. A response that failed (None) leaves its value None.
+    Each response is a small JSON object, e.g. {"grid_status": "SystemGridConnected"}
+    or {"reserve": 20}. A response that failed (None) leaves its value None.
     """
     return {
-        "is_connected": _as_bool(_field(is_connected, "is_connected")),
+        "grid_connected": _grid_connected(grid_status),
         "reserve": _as_float(_field(reserve, "reserve")),
         "mode": _as_str(_field(mode, "mode")),
         "grid_charging": _as_bool(_field(grid_charging, "grid_charging")),
@@ -240,6 +260,7 @@ class UpdateStatusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         hass: HomeAssistant,
         entry: PowerwallDashboardConfigEntry,
         url: str,
+        scan_interval: int,
     ) -> None:
         """Initialize the coordinator."""
         super().__init__(
@@ -247,7 +268,7 @@ class UpdateStatusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             _LOGGER,
             config_entry=entry,
             name=f"{DOMAIN} update status",
-            update_interval=timedelta(seconds=SCAN_INTERVAL_UPDATE),
+            update_interval=timedelta(seconds=scan_interval),
         )
         self._url = url
 
@@ -269,11 +290,62 @@ class UpdateStatusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return payload
 
 
+class DiagnosticsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
+    """Fetch per-Powerwall temperatures, fans and capacity from the proxy.
+
+    The data comes from powerwall_data.build_diagnostics(): a "powerwalls" dict
+    keyed by PW number (1 is the leader) and a "combined" block for the system.
+    """
+
+    config_entry: PowerwallDashboardConfigEntry
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        entry: PowerwallDashboardConfigEntry,
+        url: str,
+        scan_interval: int,
+    ) -> None:
+        """Initialize the coordinator."""
+        super().__init__(
+            hass,
+            _LOGGER,
+            config_entry=entry,
+            name=f"{DOMAIN} diagnostics",
+            update_interval=timedelta(seconds=scan_interval),
+        )
+        self._url = url
+
+    async def _fetch_optional(self, path: str) -> Any:
+        """GET an endpoint; None if it fails."""
+        session = async_get_clientsession(self.hass)
+        try:
+            async with session.get(
+                f"{self._url}{path}", timeout=POWERWALL_TIMEOUT
+            ) as resp:
+                resp.raise_for_status()
+                return await resp.json(content_type=None)
+        except (aiohttp.ClientError, TimeoutError, ValueError) as err:
+            _LOGGER.debug("Diagnostics endpoint %s failed: %s", path, err)
+            return None
+
+    async def _async_update_data(self) -> dict[str, Any]:
+        """Read the three endpoints concurrently and combine them."""
+        pod, temps, fans = await asyncio.gather(
+            self._fetch_optional(PYPOWERWALL_POD_PATH),
+            self._fetch_optional(PYPOWERWALL_TEMPS_PATH),
+            self._fetch_optional(PYPOWERWALL_FANS_PATH),
+        )
+        if pod is None and temps is None and fans is None:
+            raise UpdateFailed("Could not read /pod, /temps/pw or /fans/pw")
+        return build_diagnostics(pod, temps, fans)
+
+
 class ControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Read the Powerwall's control settings and send control commands.
 
     Only created when the "Allow controls" option is on. The data dict has the
-    keys "is_connected", "reserve", "mode", "grid_charging", "grid_export" and
+    keys "grid_connected", "reserve", "mode", "grid_charging", "grid_export" and
     "max_backup" (the parsed /control/max_backup response), each None if just
     that endpoint failed. Reads need no token; commands use the control secret.
     """
@@ -286,6 +358,7 @@ class ControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         entry: PowerwallDashboardConfigEntry,
         url: str,
         secret: str,
+        scan_interval: int,
     ) -> None:
         """Initialize the coordinator."""
         super().__init__(
@@ -293,13 +366,16 @@ class ControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             _LOGGER,
             config_entry=entry,
             name=f"{DOMAIN} controls",
-            update_interval=timedelta(seconds=SCAN_INTERVAL_CONTROL),
+            update_interval=timedelta(seconds=scan_interval),
         )
         self._url = url
         self._secret = secret
-        # How long "Max backup" runs when switched on. It has no endpoint to read
-        # back, so the duration number entity sets it here.
-        self.max_backup_minutes: float = DEFAULT_MAX_BACKUP_MINUTES
+        # When "Max backup" should end the next time it is switched on. It has no
+        # endpoint to read back, so the "Max backup until" entity sets it here.
+        self.max_backup_until: datetime | None = None
+        # Until this (monotonic) time, a just-set max backup value is kept even if a
+        # read disagrees, because the server caches that endpoint for 30 seconds.
+        self._max_backup_hold_until = 0.0
 
     # -- Reading -------------------------------------------------------
     async def _fetch_optional(self, path: str) -> Any:
@@ -319,7 +395,7 @@ class ControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Read every control setting concurrently."""
         data = _build_control_data(
             *await asyncio.gather(
-                self._fetch_optional(PYPOWERWALL_IS_CONNECTED_PATH),
+                self._fetch_optional(PYPOWERWALL_GRID_STATUS_PATH),
                 self._fetch_optional(PYPOWERWALL_GET_RESERVE_PATH),
                 self._fetch_optional(PYPOWERWALL_GET_MODE_PATH),
                 self._fetch_optional(CONTROL_GRID_CHARGING_PATH),
@@ -329,6 +405,15 @@ class ControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         if all(value is None for value in data.values()):
             raise UpdateFailed("Could not read any control settings from pypowerwall")
+
+        # The server caches /control/max_backup, so a read right after a change can
+        # still show the old value. Keep what was just set until the cache expires.
+        if (
+            time.monotonic() < self._max_backup_hold_until
+            and self.data
+            and self.data.get("max_backup") is not None
+        ):
+            data["max_backup"] = self.data["max_backup"]
         return data
 
     # -- Writing -------------------------------------------------------
@@ -397,7 +482,7 @@ class ControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             json_body=body,
             headers={"Authorization": f"Bearer {self._secret}"},
         )
-        self._apply(is_connected=connected)
+        self._apply(grid_connected=connected)
 
     async def async_set_reserve(self, percent: float) -> None:
         """Set the backup reserve (0-100 %)."""
@@ -422,10 +507,38 @@ class ControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         await self._async_post_form(CONTROL_GRID_EXPORT_PATH, value)
         self._apply(grid_export=value)
 
-    async def async_start_max_backup(self, minutes: float) -> None:
-        """Start a manual max backup event lasting the given number of minutes."""
-        seconds = max(MAX_BACKUP_MIN_SECONDS, round(minutes * 60))
+    async def async_start_max_backup_until(self) -> None:
+        """Start a manual max backup that ends at the "Max backup until" time.
+
+        The gateway wants a duration, so it is worked out from now. If no end time
+        is set, or it can't be honoured exactly, this raises a validation error
+        rather than quietly lasting longer or shorter than the time you chose.
+        """
+        until = self.max_backup_until
+        if until is None:
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="max_backup_until_not_set",
+            )
+
+        seconds = math.ceil((until - dt_util.utcnow()).total_seconds())
+        if seconds < MAX_BACKUP_MIN_SECONDS:
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="max_backup_until_too_soon",
+            )
+        if seconds > MAX_BACKUP_MAX_SECONDS:
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="max_backup_until_too_far",
+            )
+        await self.async_start_max_backup_seconds(seconds)
+
+    async def async_start_max_backup_seconds(self, seconds: int) -> None:
+        """Start a manual max backup event lasting the given number of seconds."""
+        seconds = max(MAX_BACKUP_MIN_SECONDS, int(seconds))
         await self._async_post_form(CONTROL_MAX_BACKUP_PATH, str(seconds))
+        self._max_backup_hold_until = time.monotonic() + MAX_BACKUP_HOLD_SECONDS
 
         now = int(time.time())
         current = (self.data or {}).get("max_backup") or {}
@@ -444,6 +557,7 @@ class ControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def async_cancel_max_backup(self) -> None:
         """Cancel the current manual max backup event."""
         await self._async_post_form(CONTROL_MAX_BACKUP_PATH, "cancel")
+        self._max_backup_hold_until = time.monotonic() + MAX_BACKUP_HOLD_SECONDS
 
         current = (self.data or {}).get("max_backup") or {}
         manual = current.get("manual_backup")

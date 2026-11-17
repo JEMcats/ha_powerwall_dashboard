@@ -9,6 +9,7 @@
           "influxdb_url": "InfluxDB URL",
           "timezone": "Timezone",
           "scan_interval": "Polling interval",
+          "temperature_unit": "Temperature unit",
           "show_strings": "Show strings",
           "allow_controls": "Allow controls"
         },
@@ -16,7 +17,8 @@
           "pypowerwall_url": "Base URL of your pypowerwall proxy, e.g. http://192.168.1.50:8675",
           "influxdb_url": "Base URL of your InfluxDB instance, e.g. http://192.168.1.50:8086",
           "timezone": "Your timezone in IANA format, e.g. America/New_York",
-          "scan_interval": "How often to fetch new data, in seconds. Lower values update faster but put more load on pypowerwall and InfluxDB.",
+          "scan_interval": "How often to fetch new data, in seconds. Applies to every sensor, switch and the firmware entity. Lower values update faster but put more load on pypowerwall and InfluxDB.",
+          "temperature_unit": "The unit Powerwall temperatures are shown in. The gateway reports Celsius and the sensors convert to this unit.",
           "show_strings": "Create a power sensor for each solar string, using the /strings endpoint of pypowerwall.",
           "allow_controls": "Enable controlling your Powerwall (e.g. changing operating mode or reserve) from Home Assistant. Only avalible for v1r or cloud configurations!"
         }
@@ -56,6 +58,15 @@
       "reconfigure_successful": "Connection settings updated"
     }
   },
+  "selector": {
+    "temperature_unit": {
+      "options": {
+        "celsius": "Celsius (°C)",
+        "fahrenheit": "Fahrenheit (°F)",
+        "kelvin": "Kelvin (K)"
+      }
+    }
+  },
   "entity": {
     "sensor": {
       "solar_power": { "name": "Solar power" },
@@ -79,14 +90,28 @@
       "solar_generated": { "name": "Solar generated" },
       "time_remaining": { "name": "Estimated time remaining" },
       "string_power": { "name": "String {string} power" },
-      "max_backup_ends": { "name": "Max backup ends" }
+      "max_backup_ends": { "name": "Max backup ends" },
+      "load_voltage": { "name": "Load voltage" },
+      "grid_voltage": { "name": "Grid voltage" },
+      "battery_voltage": { "name": "Battery voltage" },
+      "solar_voltage": { "name": "Solar voltage" },
+      "powerwall_temperature": { "name": "{powerwall} temperature" },
+      "powerwall_fan_speed": { "name": "{powerwall} fan speed" },
+      "powerwall_capacity": { "name": "{powerwall} total capacity" },
+      "powerwall_charge": { "name": "{powerwall} current charge" },
+      "powerwall_capacity_deviation": { "name": "{powerwall} capacity deviation" },
+      "combined_capacity": { "name": "Combined total capacity" },
+      "combined_charge": { "name": "Combined current charge" },
+      "combined_capacity_deviation": { "name": "Combined capacity deviation" }
     },
     "binary_sensor": {
       "storm_watch_active": { "name": "Storm Watch active" }
     },
     "number": {
-      "backup_reserve": { "name": "Backup reserve" },
-      "max_backup_duration": { "name": "Max backup duration" }
+      "backup_reserve": { "name": "Backup reserve" }
+    },
+    "datetime": {
+      "max_backup_until": { "name": "Max backup until" }
     },
     "select": {
       "operating_mode": {
@@ -115,6 +140,55 @@
       "firmware": { "name": "Firmware" }
     }
   },
+  "services": {
+    "start_max_backup": {
+      "name": "Start Max Backup",
+      "description": "Starts a max backup that keeps the battery reserved for backup for the given time. Works in seconds and does not use or change the Max backup until entity. Needs Allow controls on and a v1r-mode pypowerwall server.",
+      "fields": {
+        "duration": {
+          "name": "Duration",
+          "description": "How long max backup should run, in seconds (minimum 60)."
+        },
+        "config_entry_id": {
+          "name": "Instance",
+          "description": "Which Powerwall Dashboard instance to use. Only needed when more than one instance has controls enabled."
+        }
+      }
+    },
+    "stop_max_backup": {
+      "name": "Stop Max Backup",
+      "description": "Cancels the current max backup. The request is always sent; if the gateway refuses it (for example nothing is running), the reason is shown as an error.",
+      "fields": {
+        "config_entry_id": {
+          "name": "Instance",
+          "description": "Which Powerwall Dashboard instance to use. Only needed when more than one instance has controls enabled."
+        }
+      }
+    }
+  },
+  "exceptions": {
+    "no_control_instance": {
+      "message": "No Powerwall Dashboard instance has controls enabled. Turn on Allow controls in the integration options."
+    },
+    "multiple_instances": {
+      "message": "More than one Powerwall Dashboard instance has controls enabled. Choose one with the Instance field."
+    },
+    "unknown_instance": {
+      "message": "The selected Powerwall Dashboard instance does not exist."
+    },
+    "controls_not_enabled": {
+      "message": "Controls are not enabled for the selected Powerwall Dashboard instance."
+    },
+    "max_backup_until_not_set": {
+      "message": "Set Max backup until to a future date and time before turning on Max backup."
+    },
+    "max_backup_until_too_soon": {
+      "message": "Max backup until must be at least 1 minute from now."
+    },
+    "max_backup_until_too_far": {
+      "message": "Max backup until is further away than the gateway allows."
+    }
+  },
   "options": {
     "step": {
       "init": {
@@ -122,12 +196,14 @@
         "data": {
           "timezone": "Timezone",
           "scan_interval": "Polling interval",
+          "temperature_unit": "Temperature unit",
           "show_strings": "Show strings",
           "allow_controls": "Allow controls"
         },
         "data_description": {
           "timezone": "Your timezone in IANA format, e.g. America/New_York",
-          "scan_interval": "How often to fetch new data, in seconds. Lower values update faster but put more load on pypowerwall and InfluxDB.",
+          "scan_interval": "How often to fetch new data, in seconds. Applies to every sensor, switch and the firmware entity. Lower values update faster but put more load on pypowerwall and InfluxDB.",
+          "temperature_unit": "The unit Powerwall temperatures are shown in. Applies to the temperature sensors each time the integration loads, replacing any unit you set on them by hand.",
           "show_strings": "Create a power sensor for each solar string, using the /strings endpoint of pypowerwall.",
           "allow_controls": "Enable controlling your Powerwall from Home Assistant. Only avalible for v1r or cloud configurations!"
         }

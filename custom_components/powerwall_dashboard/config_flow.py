@@ -22,6 +22,9 @@ from homeassistant.helpers.selector import (
     NumberSelector,
     NumberSelectorConfig,
     NumberSelectorMode,
+    SelectSelector,
+    SelectSelectorConfig,
+    SelectSelectorMode,
     TextSelector,
     TextSelectorConfig,
     TextSelectorType,
@@ -35,11 +38,14 @@ from .const import (
     CONF_PYPOWERWALL_URL,
     CONF_SCAN_INTERVAL,
     CONF_SHOW_STRINGS,
+    CONF_TEMPERATURE_UNIT,
     CONF_TIMEZONE,
     DEFAULT_SCAN_INTERVAL,
+    DEFAULT_TEMPERATURE_UNIT,
     DOMAIN,
     MAX_SCAN_INTERVAL,
     MIN_SCAN_INTERVAL,
+    TEMPERATURE_UNITS,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -145,6 +151,17 @@ def _scan_interval_selector() -> NumberSelector:
     )
 
 
+def _temperature_unit_selector() -> SelectSelector:
+    """Selector for the unit temperatures are shown in (labels are translated)."""
+    return SelectSelector(
+        SelectSelectorConfig(
+            options=list(TEMPERATURE_UNITS),
+            mode=SelectSelectorMode.DROPDOWN,
+            translation_key="temperature_unit",
+        )
+    )
+
+
 # ----------------------------------------------------------------------
 # Initial setup + reconfigure
 # ----------------------------------------------------------------------
@@ -189,6 +206,7 @@ class PowerwallDashboardConfigFlow(ConfigFlow, domain=DOMAIN):
                     CONF_ALLOW_CONTROLS: user_input[CONF_ALLOW_CONTROLS],
                     CONF_SCAN_INTERVAL: int(user_input[CONF_SCAN_INTERVAL]),
                     CONF_SHOW_STRINGS: user_input[CONF_SHOW_STRINGS],
+                    CONF_TEMPERATURE_UNIT: user_input[CONF_TEMPERATURE_UNIT],
                 }
 
                 if self._data[CONF_ALLOW_CONTROLS]:
@@ -203,6 +221,9 @@ class PowerwallDashboardConfigFlow(ConfigFlow, domain=DOMAIN):
                 vol.Required(
                     CONF_SCAN_INTERVAL, default=DEFAULT_SCAN_INTERVAL
                 ): _scan_interval_selector(),
+                vol.Required(
+                    CONF_TEMPERATURE_UNIT, default=DEFAULT_TEMPERATURE_UNIT
+                ): _temperature_unit_selector(),
                 vol.Required(CONF_SHOW_STRINGS, default=False): BooleanSelector(),
                 vol.Required(CONF_ALLOW_CONTROLS, default=False): BooleanSelector(),
             }
@@ -318,6 +339,7 @@ class PowerwallDashboardOptionsFlow(OptionsFlow):
                     CONF_ALLOW_CONTROLS: user_input[CONF_ALLOW_CONTROLS],
                     CONF_SCAN_INTERVAL: int(user_input[CONF_SCAN_INTERVAL]),
                     CONF_SHOW_STRINGS: user_input[CONF_SHOW_STRINGS],
+                    CONF_TEMPERATURE_UNIT: user_input[CONF_TEMPERATURE_UNIT],
                 }
                 if self._options[CONF_ALLOW_CONTROLS]:
                     return await self.async_step_controls()
@@ -331,6 +353,10 @@ class PowerwallDashboardOptionsFlow(OptionsFlow):
                     CONF_SCAN_INTERVAL,
                     default=current.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL),
                 ): _scan_interval_selector(),
+                vol.Required(
+                    CONF_TEMPERATURE_UNIT,
+                    default=current.get(CONF_TEMPERATURE_UNIT, DEFAULT_TEMPERATURE_UNIT),
+                ): _temperature_unit_selector(),
                 vol.Required(
                     CONF_SHOW_STRINGS,
                     default=current.get(CONF_SHOW_STRINGS, False),

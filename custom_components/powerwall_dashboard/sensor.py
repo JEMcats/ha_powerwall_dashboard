@@ -13,15 +13,28 @@ from homeassistant.components.sensor import (
     SensorEntityDescription,
     SensorStateClass,
 )
-from homeassistant.const import PERCENTAGE, UnitOfEnergy, UnitOfPower, UnitOfTime
-from homeassistant.core import HomeAssistant
+from homeassistant.const import (
+    PERCENTAGE,
+    EntityCategory,
+    UnitOfElectricPotential,
+    UnitOfEnergy,
+    UnitOfPower,
+    UnitOfTemperature,
+    UnitOfTime,
+)
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import StateType
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DEFAULT_STRING_NAMES
-from .coordinator import ControlCoordinator, InfluxDbCoordinator, PyPowerwallCoordinator
+from .const import DEFAULT_STRING_NAMES, DOMAIN, GRID_STATUS_MAP
+from .coordinator import (
+    ControlCoordinator,
+    DiagnosticsCoordinator,
+    InfluxDbCoordinator,
+    PyPowerwallCoordinator,
+)
 from .entity import PowerwallControlEntity, max_backup_end, powerwall_device_info
 
 if TYPE_CHECKING:
@@ -53,19 +66,30 @@ def _power_kw(section: str) -> Callable[[dict[str, Any]], float | None]:
     return _get
 
 
+def _voltage(section: str) -> Callable[[dict[str, Any]], float | None]:
+    """Return a value_fn reading aggregates[section].instant_average_voltage, in V.
+
+    section is the pypowerwall meter name: solar, battery, site (grid) or load.
+    """
+
+    def _get(data: dict[str, Any]) -> float | None:
+        try:
+            value = data["aggregates"][section]["instant_average_voltage"]
+        except (KeyError, TypeError):
+            return None
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return float(value)
+
+    return _get
+
+
 def _percentage_charged(data: dict[str, Any]) -> float | None:
     """Battery state of energy, in percent."""
     try:
         return data["soe"]["percentage"]
     except (KeyError, TypeError):
         return None
-
-
-GRID_STATUS_MAP = {
-    "SystemGridConnected": "connected",
-    "SystemIslandedActive": "disconnected",
-    "SystemTransitionToGrid": "transitioning",
-}
 
 
 def _grid_status(data: dict[str, Any]) -> str | None:
@@ -153,6 +177,47 @@ POWERWALL_SENSORS: tuple[PowerwallSensorDescription, ...] = (
         state_class=SensorStateClass.MEASUREMENT,
         suggested_display_precision=2,
         value_fn=_time_remaining,
+    ),
+    PowerwallSensorDescription(
+        key="load_voltage",
+        translation_key="load_voltage",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        native_unit_of_measurement=UnitOfElectricPotential.VOLT,
+        device_class=SensorDeviceClass.VOLTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        suggested_display_precision=1,
+        value_fn=_voltage("load"),
+    ),
+    PowerwallSensorDescription(
+        key="grid_voltage",
+        translation_key="grid_voltage",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        native_unit_of_measurement=UnitOfElectricPotential.VOLT,
+        device_class=SensorDeviceClass.VOLTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        suggested_display_precision=1,
+        # pypowerwall calls the grid meter "site".
+        value_fn=_voltage("site"),
+    ),
+    PowerwallSensorDescription(
+        key="battery_voltage",
+        translation_key="battery_voltage",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        native_unit_of_measurement=UnitOfElectricPotential.VOLT,
+        device_class=SensorDeviceClass.VOLTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        suggested_display_precision=1,
+        value_fn=_voltage("battery"),
+    ),
+    PowerwallSensorDescription(
+        key="solar_voltage",
+        translation_key="solar_voltage",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        native_unit_of_measurement=UnitOfElectricPotential.VOLT,
+        device_class=SensorDeviceClass.VOLTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        suggested_display_precision=1,
+        value_fn=_voltage("solar"),
     ),
 )
 
@@ -325,6 +390,282 @@ class MaxBackupEndsSensor(PowerwallControlEntity, SensorEntity):
 
 
 # ----------------------------------------------------------------------
+# Per-Powerwall and combined diagnostics (/pod, /temps/pw, /fans/pw)
+#
+# Powerwalls are numbered PW1, PW2, ... by pypowerwall, leader first. They are
+# discovered from the data, so a Powerwall that wasn't reachable at startup still
+# gets its sensors as soon as it shows up.
+# ----------------------------------------------------------------------
+UNIT_RPM = "rpm"
+
+
+@dataclass(frozen=True, kw_only=True)
+class DiagnosticSensorDescription(SensorEntityDescription):
+    """Describes a diagnostic sensor read from a Powerwall's or the combined block."""
+
+    value_fn: Callable[[dict[str, Any]], float | None]
+    attrs_fn: Callable[[dict[str, Any]], dict[str, Any]] | None = None
+    # Whether a Powerwall's block has the data this sensor needs, so e.g. a
+    # Powerwall 2 (no fan data) doesn't get a permanently empty fan sensor.
+    applies_fn: Callable[[dict[str, Any]], bool] = lambda block: True
+
+
+def _round(value: Any, digits: int) -> Any:
+    """Round a number for display in an attribute; pass anything else through."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return round(value, digits)
+    return value
+
+
+def _capacity_attrs(unit: dict[str, Any]) -> dict[str, Any]:
+    """Which Powerwall this is, and the published capacity it is compared to."""
+    return {
+        "model": unit.get("model"),
+        "device": unit.get("name"),
+        "spec_kwh": unit.get("spec_kwh"),
+    }
+
+
+def _deviation_attrs(block: dict[str, Any]) -> dict[str, Any]:
+    """The published capacity and the difference from it, in kWh."""
+    return {
+        "spec_kwh": block.get("spec_kwh"),
+        "difference_kwh": _round(block.get("difference_kwh"), 3),
+    }
+
+
+def _fan_attrs(unit: dict[str, Any]) -> dict[str, Any]:
+    """Each of this Powerwall's fans (the state is their average speed)."""
+    attrs: dict[str, Any] = {}
+    for fan in unit.get("fans") or []:
+        attrs[f"fan_{fan['slot']}_rpm"] = fan.get("rpm")
+        attrs[f"fan_{fan['slot']}_duty_percent"] = fan.get("duty")
+    return attrs
+
+
+UNIT_SENSORS: tuple[DiagnosticSensorDescription, ...] = (
+    DiagnosticSensorDescription(
+        key="temperature",
+        translation_key="powerwall_temperature",
+        native_unit_of_measurement=UnitOfTemperature.CELSIUS,
+        device_class=SensorDeviceClass.TEMPERATURE,
+        state_class=SensorStateClass.MEASUREMENT,
+        suggested_display_precision=1,
+        value_fn=lambda unit: unit.get("temperature_c"),
+        applies_fn=lambda unit: unit["has_temperature"],
+    ),
+    DiagnosticSensorDescription(
+        key="fan_speed",
+        translation_key="powerwall_fan_speed",
+        icon="mdi:fan",
+        native_unit_of_measurement=UNIT_RPM,
+        state_class=SensorStateClass.MEASUREMENT,
+        suggested_display_precision=0,
+        value_fn=lambda unit: unit.get("fan_rpm"),
+        attrs_fn=_fan_attrs,
+        applies_fn=lambda unit: unit["has_fans"],
+    ),
+    DiagnosticSensorDescription(
+        key="capacity",
+        translation_key="powerwall_capacity",
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        device_class=SensorDeviceClass.ENERGY_STORAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        suggested_display_precision=2,
+        value_fn=lambda unit: unit.get("capacity_kwh"),
+        attrs_fn=_capacity_attrs,
+        applies_fn=lambda unit: unit["has_pod"],
+    ),
+    DiagnosticSensorDescription(
+        key="charge",
+        translation_key="powerwall_charge",
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        device_class=SensorDeviceClass.ENERGY_STORAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        suggested_display_precision=2,
+        value_fn=lambda unit: unit.get("charge_kwh"),
+        applies_fn=lambda unit: unit["has_pod"],
+    ),
+    DiagnosticSensorDescription(
+        key="capacity_deviation",
+        translation_key="powerwall_capacity_deviation",
+        icon="mdi:battery-heart-outline",
+        native_unit_of_measurement=PERCENTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        suggested_display_precision=1,
+        value_fn=lambda unit: unit.get("deviation_percent"),
+        attrs_fn=_deviation_attrs,
+        applies_fn=lambda unit: unit["has_pod"],
+    ),
+)
+
+COMBINED_SENSORS: tuple[DiagnosticSensorDescription, ...] = (
+    DiagnosticSensorDescription(
+        key="capacity",
+        translation_key="combined_capacity",
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        device_class=SensorDeviceClass.ENERGY_STORAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        suggested_display_precision=2,
+        value_fn=lambda combined: combined.get("capacity_kwh"),
+    ),
+    DiagnosticSensorDescription(
+        key="charge",
+        translation_key="combined_charge",
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        device_class=SensorDeviceClass.ENERGY_STORAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        suggested_display_precision=2,
+        value_fn=lambda combined: combined.get("charge_kwh"),
+    ),
+    DiagnosticSensorDescription(
+        key="capacity_deviation",
+        translation_key="combined_capacity_deviation",
+        icon="mdi:battery-heart-outline",
+        native_unit_of_measurement=PERCENTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        suggested_display_precision=1,
+        value_fn=lambda combined: combined.get("deviation_percent"),
+        attrs_fn=_deviation_attrs,
+    ),
+)
+
+
+class PowerwallDiagnosticSensor(
+    CoordinatorEntity[DiagnosticsCoordinator], SensorEntity
+):
+    """A diagnostic sensor for one Powerwall, or for the whole system.
+
+    index is the Powerwall's number (1 is the leader), or None for the combined
+    sensors. temperature_unit, for temperature sensors, is the display unit chosen
+    in the integration's options.
+    """
+
+    entity_description: DiagnosticSensorDescription
+    _attr_has_entity_name = True
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(
+        self,
+        coordinator: DiagnosticsCoordinator,
+        description: DiagnosticSensorDescription,
+        entry: PowerwallDashboardConfigEntry,
+        index: int | None,
+        temperature_unit: str | None = None,
+    ) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator)
+        self.entity_description = description
+        self._index = index
+        scope = "combined" if index is None else f"pw{index}"
+        self._attr_unique_id = f"{entry.entry_id}_{scope}_{description.key}"
+        if index is not None:
+            self._attr_translation_placeholders = {"powerwall": f"PW{index}"}
+        if temperature_unit is not None:
+            # Used when the entity is first registered; _apply_temperature_unit
+            # handles entities that already exist.
+            self._attr_suggested_unit_of_measurement = temperature_unit
+        self._attr_device_info = powerwall_device_info(entry)
+
+    @property
+    def _block(self) -> dict[str, Any] | None:
+        """This Powerwall's block of the data, or the combined block."""
+        data = self.coordinator.data or {}
+        if self._index is None:
+            return data.get("combined")
+        return (data.get("powerwalls") or {}).get(self._index)
+
+    @property
+    def native_value(self) -> float | None:
+        """Return the sensor value."""
+        block = self._block
+        return self.entity_description.value_fn(block) if block else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Return extra details, if this sensor has any."""
+        block = self._block
+        if not block or self.entity_description.attrs_fn is None:
+            return None
+        return self.entity_description.attrs_fn(block)
+
+
+@callback
+def _apply_temperature_unit(hass: HomeAssistant, unique_id: str, unit: str) -> None:
+    """Make an already-registered temperature sensor display in the chosen unit.
+
+    Home Assistant normally shows temperatures in its own unit system, and only
+    honours a sensor's suggested unit the first time it is registered. Setting the
+    entity's unit option is what makes a later change to the integration's
+    Temperature unit setting take effect.
+    """
+    registry = er.async_get(hass)
+    entity_id = registry.async_get_entity_id("sensor", DOMAIN, unique_id)
+    if entity_id is None or (entry := registry.async_get(entity_id)) is None:
+        return  # not registered yet: the suggested unit covers it
+    options = dict(entry.options.get("sensor", {}))
+    if options.get("unit_of_measurement") == unit:
+        return
+    options["unit_of_measurement"] = unit
+    registry.async_update_entity_options(entity_id, "sensor", options)
+
+
+@callback
+def _async_track_diagnostics(
+    hass: HomeAssistant,
+    entry: PowerwallDashboardConfigEntry,
+    async_add_entities: AddEntitiesCallback,
+) -> None:
+    """Add diagnostic sensors now, and for any Powerwall that appears later."""
+    data = entry.runtime_data
+    coordinator = data.diagnostics_coordinator
+    known: set[str] = set()
+
+    @callback
+    def _add_new() -> None:
+        diagnostics = coordinator.data or {}
+        new: list[PowerwallDiagnosticSensor] = []
+
+        for index, unit in sorted((diagnostics.get("powerwalls") or {}).items()):
+            for description in UNIT_SENSORS:
+                unique_key = f"pw{index}_{description.key}"
+                if unique_key in known or not description.applies_fn(unit):
+                    continue
+                known.add(unique_key)
+                is_temperature = description.key == "temperature"
+                sensor = PowerwallDiagnosticSensor(
+                    coordinator,
+                    description,
+                    entry,
+                    index,
+                    data.temperature_unit if is_temperature else None,
+                )
+                if is_temperature:
+                    _apply_temperature_unit(
+                        hass, sensor.unique_id, data.temperature_unit
+                    )
+                new.append(sensor)
+
+        # The combined sensors need at least one Powerwall reporting pod data.
+        if (diagnostics.get("combined") or {}).get("count"):
+            for description in COMBINED_SENSORS:
+                unique_key = f"combined_{description.key}"
+                if unique_key in known:
+                    continue
+                known.add(unique_key)
+                new.append(
+                    PowerwallDiagnosticSensor(coordinator, description, entry, None)
+                )
+
+        if new:
+            async_add_entities(new)
+
+    _add_new()
+    # Also keeps the coordinator polling, so Powerwalls are discovered over time.
+    entry.async_on_unload(coordinator.async_add_listener(_add_new))
+
+
+# ----------------------------------------------------------------------
 # Platform setup
 # ----------------------------------------------------------------------
 async def async_setup_entry(
@@ -363,3 +704,4 @@ async def async_setup_entry(
         entities.append(MaxBackupEndsSensor(data.control_coordinator, entry))
 
     async_add_entities(entities)
+    _async_track_diagnostics(hass, entry, async_add_entities)

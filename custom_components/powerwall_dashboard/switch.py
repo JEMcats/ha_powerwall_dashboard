@@ -21,8 +21,10 @@ if TYPE_CHECKING:
 class GridConnectionSwitch(PowerwallControlEntity, SwitchEntity):
     """Manual grid connection. Off islands the house from the grid.
 
-    The state comes from /pw/is_connected. The server locks islanding for a
-    minute after any request, so a second toggle right away is refused.
+    The state comes from /api/system_status/grid_status, the same data as the Grid
+    status sensor: on is connected, off is islanded, and unknown while the gateway
+    is transitioning back to the grid. The server locks islanding for a minute
+    after any request, so a second toggle right away is refused.
     """
 
     _attr_icon = "mdi:transmission-tower"
@@ -38,7 +40,7 @@ class GridConnectionSwitch(PowerwallControlEntity, SwitchEntity):
     @property
     def is_on(self) -> bool | None:
         """True while connected to the grid."""
-        return self.control_data.get("is_connected")
+        return self.control_data.get("grid_connected")
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Reconnect to the grid."""
@@ -50,9 +52,10 @@ class GridConnectionSwitch(PowerwallControlEntity, SwitchEntity):
 
 
 class MaxBackupSwitch(PowerwallControlEntity, SwitchEntity):
-    """Max backup (reserves the battery for backup) for a set duration.
+    """Max backup (reserves the battery for backup) until a chosen time.
 
-    On starts a backup lasting the "Max backup duration" number; off cancels it.
+    On starts a backup that ends at the "Max backup until" date and time; off
+    cancels it.
     """
 
     _attr_icon = "mdi:battery-heart-variant"
@@ -71,10 +74,8 @@ class MaxBackupSwitch(PowerwallControlEntity, SwitchEntity):
         return max_backup_active(self.control_data)
 
     async def async_turn_on(self, **kwargs: Any) -> None:
-        """Start max backup for the configured duration."""
-        await self.coordinator.async_start_max_backup(
-            self.coordinator.max_backup_minutes
-        )
+        """Start max backup, ending at the "Max backup until" time."""
+        await self.coordinator.async_start_max_backup_until()
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Cancel max backup."""

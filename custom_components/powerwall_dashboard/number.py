@@ -1,23 +1,17 @@
-"""Number platform: backup reserve and max backup duration.
+"""Number platform: backup reserve.
 
-These only exist when "Allow controls" is on.
+Only exists when "Allow controls" is on.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from homeassistant.components.number import (
-    NumberDeviceClass,
-    NumberEntity,
-    NumberMode,
-    RestoreNumber,
-)
-from homeassistant.const import PERCENTAGE, UnitOfTime
+from homeassistant.components.number import NumberEntity, NumberMode
+from homeassistant.const import PERCENTAGE
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import MAX_BACKUP_MAX_MINUTES, MAX_BACKUP_MIN_MINUTES
 from .coordinator import ControlCoordinator
 from .entity import PowerwallControlEntity
 
@@ -53,49 +47,6 @@ class BackupReserveNumber(PowerwallControlEntity, NumberEntity):
         await self.coordinator.async_set_reserve(value)
 
 
-class MaxBackupDurationNumber(PowerwallControlEntity, RestoreNumber):
-    """How long (in minutes) "Max backup" runs when it is switched on.
-
-    This is a Home Assistant-side setting: the gateway has no endpoint to read
-    it back, so it is remembered across restarts instead.
-    """
-
-    _attr_native_min_value = MAX_BACKUP_MIN_MINUTES
-    _attr_native_max_value = MAX_BACKUP_MAX_MINUTES
-    _attr_native_step = 1
-    _attr_native_unit_of_measurement = UnitOfTime.MINUTES
-    _attr_device_class = NumberDeviceClass.DURATION
-    _attr_mode = NumberMode.BOX
-    _attr_icon = "mdi:timer-outline"
-
-    def __init__(
-        self,
-        coordinator: ControlCoordinator,
-        entry: PowerwallDashboardConfigEntry,
-    ) -> None:
-        """Initialize the number."""
-        super().__init__(coordinator, entry, "max_backup_duration")
-
-    async def async_added_to_hass(self) -> None:
-        """Restore the last value the user chose."""
-        await super().async_added_to_hass()
-        last = await self.async_get_last_number_data()
-        if last is not None and last.native_value is not None:
-            self.coordinator.max_backup_minutes = min(
-                max(last.native_value, MAX_BACKUP_MIN_MINUTES), MAX_BACKUP_MAX_MINUTES
-            )
-
-    @property
-    def native_value(self) -> float:
-        """The duration the Max backup switch will use."""
-        return self.coordinator.max_backup_minutes
-
-    async def async_set_native_value(self, value: float) -> None:
-        """Remember the new duration (nothing is sent until Max backup is on)."""
-        self.coordinator.max_backup_minutes = value
-        self.async_write_ha_state()
-
-
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: PowerwallDashboardConfigEntry,
@@ -106,9 +57,4 @@ async def async_setup_entry(
     if coordinator is None:
         return
 
-    async_add_entities(
-        [
-            BackupReserveNumber(coordinator, entry),
-            MaxBackupDurationNumber(coordinator, entry),
-        ]
-    )
+    async_add_entities([BackupReserveNumber(coordinator, entry)])

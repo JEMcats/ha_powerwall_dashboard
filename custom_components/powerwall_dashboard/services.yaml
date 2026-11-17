@@ -1,0 +1,25 @@
+start_max_backup:
+  fields:
+    duration:
+      required: true
+      example: 3600
+      selector:
+        number:
+          min: 60
+          max: 4294967295
+          step: 1
+          mode: box
+          unit_of_measurement: s
+    config_entry_id:
+      required: false
+      selector:
+        config_entry:
+          integration: powerwall_dashboard
+
+stop_max_backup:
+  fields:
+    config_entry_id:
+      required: false
+      selector:
+        config_entry:
+          integration: powerwall_dashboard
